@@ -1,0 +1,1 @@
+I mit projekt har jeg lavet en classificer, som kan genkende 2 slags hunderacer, herunder Viszla og Doberman. Jeg har kun gjort brug af 30 billeder af hver race, så præcisionen af denne model er ikke den bedste.
