@@ -1,169 +1,162 @@
 import os
 import torch
-import matplotlib.pyplot as plt
 
 from PIL import Image
 from torchvision import transforms, datasets
-from typing import Callable
+from typing import Any, Callable
 from torch.utils import data
 from torch import nn, optim, cuda
 from tqdm import tqdm
 
-from model import model
+from model import DogBreedClassifier
 
 device = "cuda" if cuda.is_available() else "cpu"
 
-transformers = transforms.Compose([
-    # ændre størrelsen på billedet til 224x224
-    transforms.Resize((512, 512)),
-    # for at forbedre træningsmodellen, kan vi tilfældeligt flippe
-    # billedet for at skabe større differens i billederne. der er 
-    # 50% chance for at billedet flipper.
-    transforms.RandomHorizontalFlip(),
-    transforms.TrivialAugmentWide(),
-    # ændre bit værdierne for billederne til tensor værdier.
-    transforms.ToTensor()
-])
+def train_step(
+    model: nn.Module, 
+    dataloader: data.DataLoader,
+    criterion: Callable, 
+    optimizer: Callable
+) -> dict[str, Any]:
+    running_loss, running_acc = 0, 0
 
-training_transformers = transforms.Compose([
-    transforms.Resize((512, 512)),
-    transforms.ToTensor()
-])
+    for image, label in dataloader:
+        image, label = image.to(device), label.to(device)
 
-train_data = datasets.ImageFolder(root="./races", transform=transformers)
-test_data = datasets.ImageFolder(root="./test", transform=training_transformers)
+        score = model(image)
 
-torch.manual_seed(42)
+        loss = criterion(score, label)
+        running_loss += loss
 
-NUM_WORKERS = os.cpu_count()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-train_dataloader = data.DataLoader(dataset=train_data, batch_size=16, num_workers=0, shuffle=True)
-test_dataloader = data.DataLoader(dataset=test_data, batch_size=16, num_workers=0, shuffle=False)
+        score_class = torch.argmax(torch.softmax(score, dim=1), dim=1)
+        running_acc += (score_class == label).sum().item()/len(score_class)
+    
+    return {"train_loss": running_loss, "train_acc": running_acc}
 
-def train_model(model: nn.Module, dataloader: data.DataLoader) -> None:
+def test_step(
+    model: nn.Module, 
+    dataloader: data.DataLoader,
+    criterion: Callable
+) -> dict[str, Any]:
+    running_loss, running_acc = 0, 0
+
+    for image, label in dataloader:
+        image, label = image.to(device), label.to(device)
+
+        score = model(image)
+
+        loss = criterion(score, label)
+        running_loss += loss
+
+        score_class = torch.argmax(score, dim=1)
+        running_acc += (score_class == label).sum().item()/len(score_class)
+    
+    return {"test_loss": running_loss, "test_acc": running_acc}
+
+def train_model(
+    model: nn.Module, 
+    dataloader: data.DataLoader, 
+    criterion: Callable, 
+    optimizer: Callable, 
+    epoch_iterations: int = 5
+) -> list[dict[str, Any]]:
     model.train()
 
-    loss_fn = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(params=model.parameters(), lr=1e-3)
-
     epochs = []
-    for epoch in tqdm(range(5)):
-        result = {"train_acc": 0, "train_loss": 0, "test_acc": 0, "test_loss": 0}
+    for epoch in tqdm(range(epoch_iterations)):
+        step = train_step(model, dataloader, criterion, optimizer)
+        epochs.append(step)
 
-        for batch, (x, y) in enumerate(dataloader):
-            x, y = x.to(device), y.to(device)
-            
-            logps = model(x)
-            loss = loss_fn(logps, y)
-            result["train_loss"] += loss
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            logps_class = torch.argmax(torch.softmax(logps, dim=1), dim=1)
-            result["train_acc"] += (logps_class == y).sum().item()/len(logps)
-        print("train step is done")
-        with torch.inference_mode():
-            for batch, (x, y) in enumerate(dataloader):
-                x, y = x.to(device), y.to(device)
-                
-                logps = model(x)
-                print(logps, "train model", type(logps))
-                loss = loss_fn(logps, y)
-                result["test_loss"] += loss
-
-                logps_class = torch.argmax(logps, dim=1)
-                result["test_acc"] += (logps_class == y).sum().item()/len(logps)
-        print("test step is done")
-        epochs.append(result)
-        print(result)
+        if epoch == epoch_iterations - 1:
+            torch.save({
+                "model_state_dict": model.state_dict(), 
+                "optimizer_state_dict": optimizer.state_dict(),
+            }, f"models/checkpoint_last_epoch.pt")
 
     return epochs
 
-def main():
-    epochs = train_model(model, train_dataloader)
-    print("done training")
-    print(epochs)
-    for epoch in epochs:
-        print(epoch)
+def test_model(model: nn.Module, dataloader: data.DataLoader) -> list[dict[str, Any]]:
+    model.eval()
 
+    criterion = nn.CrossEntropyLoss()
+    # optimizer = optim.Adam(params=model.parameters(), lr=1e-3)
+
+    epochs = []
+
+    with torch.no_grad():
+        step = test_step(model, dataloader, criterion)
+        epochs.append(step)
+
+    return epochs
+
+def any_available_models() -> bool:
+    return len(os.listdir("models")) > 0
+
+def predict_random_dog(image_path: str, model: nn.Module, transform: Callable) -> str:
+    model.eval()
+
+    image = Image.open(image_path).convert('RGB')
+    augmented_image = transform(image).unsqueeze(dim=0).to(device)
+
+    with torch.no_grad():
+        score = model(augmented_image)
+
+    _, preds = torch.max(score, 1)
+
+    print(f"{image_path} is a {"Viszla" if preds[0] == 1 else "Doberman"}")
+
+def main():
+    transformers = transforms.Compose([
+        # ændre størrelsen på billedet til 224x224
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    training_transformers = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor()
+    ])
+
+    train_data = datasets.ImageFolder(root="./races", transform=transformers)
+    test_data = datasets.ImageFolder(root="./test", transform=training_transformers)
+
+    torch.manual_seed(42)
+
+    NUM_WORKERS = os.cpu_count()
+
+    train_dataloader = data.DataLoader(dataset=train_data, batch_size=64, num_workers=NUM_WORKERS, shuffle=True)
+    test_dataloader = data.DataLoader(dataset=test_data, batch_size=64, num_workers=NUM_WORKERS, shuffle=False)
+
+    model = DogBreedClassifier().to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(params=model.parameters(), lr=1e-3)
+    
+    if not any_available_models():
+        print("no saved checkpoints. running training program")
+        train_model(model, train_dataloader, criterion, optimizer, epoch_iterations=200)
+        test_model(model, test_dataloader)
+
+        print("finished training. try running the program again to test model")
+        raise SystemExit(1)
+    
+    
+    checkpoint = torch.load("models/checkpoint_last_epoch.pt")
+    print("found model checkpoint")
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    for _, _, filenames in os.walk("untrained_pictures"):
+        for filename in filenames:
+            real_path = os.path.join("untrained_pictures", filename)
+
+            predict_random_dog(real_path, model, transformers)
 
 if __name__ == "__main__":
     main()
-
-# fig = plt.figure()
-
-# def visualize_transformed_data(image_path: str, transform: Callable) -> None:
-#     for dirpath, dirname, filenames in os.walk(image_path):
-#         for i, filename in enumerate(filenames):
-#             real_path = os.path.join(image_path, filename)
-#             print(real_path)
-            
-#             with Image.open(real_path) as image:
-#                 ax = plt.subplot(4, 3, i + 1)
-#                 plt.tight_layout()
-#                 ax.set_title(filename)
-#                 ax.axis('off')
-#                 image = transform(image).permute(1, 2, 0)
-#                 plt.imshow(image)
-
-# visualize_transformed_data("races/viszla", transformers)
-
-# plt.show()
-
-
-# trainset = DogRaceDataset("dog_races.csv", "dog_races/", transform=v2.Resize(size=(256, 256), antialias=False))
-# trainloader = data.DataLoader(trainset, batch_size=10, shuffle=True)
-
-# model = nn.Sequential(nn.Linear(7680, 256),
-#                       nn.ReLU(),
-#                       nn.Linear(256, 256))
-
-# criterion = nn.NLLLoss()
-# optimizer = optim.SGD(model.parameters(), lr=0.003)
-
-# for e in range(5):
-#     running_loss = 0
-#     for viszla in trainloader:
-#         print(viszla["image"].shape[::-1])
-#         images = viszla["image"].view(viszla["image"].shape[::-1][0], -1)
-#         print(images)
-    
-#         # TODO: Training pass
-#         optimizer.zero_grad()
-#         output = model(images.to(torch.float32))
-#         loss = criterion(output, viszla["race"])
-#         loss.backward()
-#         optimizer.step()
-        
-#         running_loss += loss.item()
-#     else:
-#         print(f"Training loss: {running_loss/len(trainloader)}")
-
-# # # Get our data
-# # viszla = next(iter(trainloader))
-# # # Flatten images
-# # images = images.view(images.shape[0], -1)
-
-# # # Forward pass, get our logits
-# # logits = model(images)
-# # # Calculate the loss with the logits and the labels
-# # loss = criterion(logits, labels)
-
-# fig = plt.figure()
-
-# for i, viszla in enumerate(training_data):
-#     print(viszla["pathname"])
-    # ax = plt.subplot(4, 3, i + 1)
-    # plt.tight_layout()
-    # ax.set_title(viszla["pathname"])
-    # ax.axis('off')
-
-#     viszla["image"] = viszla["image"].swapaxes(0, 1)
-#     viszla["image"] = viszla["image"].swapaxes(1, 2)
-
-#     plt.imshow(viszla["image"])
-
-# plt.show()  
-
